@@ -31,10 +31,13 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
@@ -51,8 +54,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.text.NumberFormat
 
 
 class MainActivity : ComponentActivity() {
@@ -76,17 +82,31 @@ class MainActivity : ComponentActivity() {
 
     private val _apiData = MutableStateFlow<List<Currency>?>(null)
     val apiData: StateFlow<List<Currency>?> = _apiData
-    private val _apiFailed = MutableStateFlow<Boolean>(false)
+    private val _apiFailed = MutableStateFlow(false)
     val apiFailed: StateFlow<Boolean> = _apiFailed
 
 
     private fun getReqToArion() {
-        // COROUTINE ACTION
+        // WE LOVE COROUTINES
         lifecycleScope.launch {
             try {
                 val client = OkHttpClient()
+
+                val getUrl = "https://www.arionbanki.is/Webservice/PortalCurrency.ashx".toHttpUrl()
+                    .newBuilder()
+                    .addQueryParameter("m", "GetCurrencies")
+                    .addQueryParameter("currencyType", "AlmenntGengi")
+                    .addQueryParameter("beginDate", "2025-02-19")
+                    .addQueryParameter("finalDate", "2025-02-19")
+                    .addQueryParameter("currenciesAvailable",
+                        "ISK,USD,GBP,EUR,CAD,DKK,NOK,SEK,CHF,JPY,PLN,XDR,RUB,ZAR,NZD,HKD,AUD")
+                    .addQueryParameter("TypeCode", "A")
+                    .build()
+
+                Log.d("API - url", getUrl.toString())
+
                 val request = Request.Builder()
-                    .url("https://www.arionbanki.is/Webservice/PortalCurrency.ashx?m=GetCurrencies&currencyType=AlmenntGengi&beginDate=2025-02-19&finalDate=2025-02-19&currenciesAvailable=ISK%2CUSD%2CGBP%2CEUR%2CCAD%2CDKK%2CNOK%2CSEK%2CCHF%2CJPY%2CPLN%2CXDR%2CRUB%2CZAR%2CNZD%2CHKD%2CAUD&TypeCode=A")
+                    .url(getUrl)
                     .build()
                 Log.d("API " , "BEFORE DISPATCH")
 
@@ -111,6 +131,10 @@ class MainActivity : ComponentActivity() {
 
                 try {
                     val parsedData: List<Currency> = gson.fromJson(responseBody, listType)
+                    if(parsedData.isEmpty()) {
+                        _apiFailed.value = true;
+                        return@launch
+                    }
                     _apiData.value = parsedData
                     Log.d("API Parse", "🔥 Data successfully parsed: $parsedData")
                 } catch (e: Exception) {
@@ -124,6 +148,47 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+}
+
+class CurrencyConverter(
+    private val currencyData: List<Currency>,
+    val baseCurrencyTicker: String,
+) {
+    /**
+     * Convert an amount from one currency to another
+     * @param amount The amount to convert
+     * @param from The currency ticker to convert from
+     * @param to The currency ticker to convert to
+     * @return The converted amount
+     */
+    fun convertCurrency(amount: Double, from: String, to: String): Double {
+        if (from == to) {
+            return amount
+        }
+
+        val fromCurrency = currencyData.find { it.ticker == from }
+        val toCurrency = currencyData.find { it.ticker == to }
+
+        if (fromCurrency == null || toCurrency == null) {
+            throw IllegalArgumentException("Currency not found: $from or $to")
+        }
+        Log.d("convert", "$amount ${toCurrency.buyPrice} ${fromCurrency.buyPrice}")
+
+        return when {
+            from == baseCurrencyTicker -> {
+                amount / toCurrency.buyPrice
+            }
+            to == baseCurrencyTicker -> {
+                amount * fromCurrency.buyPrice
+            }
+            else -> {
+                // First convert to base, then to target
+                val amountInBase = amount * fromCurrency.buyPrice
+                amountInBase / toCurrency.buyPrice
+            }
+        }
+    }
+
 }
 
 data class Currency(
@@ -140,9 +205,10 @@ data class Currency(
 @Composable
 fun CurrencyField(
     currency: Currency,
-    baseCurrency: String,
-    baseValue: String,
-    onBaseValueChange: (String, String) -> Unit
+    cc: CurrencyConverter,
+    baseAmount: Double,
+    baseCurrencyTicker: String,
+    onValueChange: (Double, String) -> Unit
 ){
     Row(modifier = Modifier
         .padding(all = 10.dp)
@@ -157,7 +223,11 @@ fun CurrencyField(
                 .clip(CircleShape)
         )
 
-        var text by remember { mutableStateOf("yee/haw") }
+        val convertedValue = cc.convertCurrency(
+            baseAmount,
+            baseCurrencyTicker,
+            currency.ticker
+        )
 
         Row (modifier = Modifier
             .wrapContentHeight()
@@ -169,16 +239,21 @@ fun CurrencyField(
             Text(text = currency.sellPrice.toString())
 
             // val convertedValue = convertCurrency(baseValue.toDoubleOrNull() ?: 0.0, baseCurrency, currency.ticker)
-
             OutlinedTextField(
-
-                value = text,
-                onValueChange = {
-                    text = it  // Update local text field
-                    onBaseValueChange(it, currency.ticker)  // Pass the new value and the currency code to the parent composable
+                value = NumberFormat.getNumberInstance()
+                    .apply { maximumFractionDigits = 3; minimumFractionDigits = 1 }
+                    .format(convertedValue),
+                onValueChange = { newValue ->
+                    try {
+                        val newAmount = newValue.toDouble()
+                        onValueChange(newAmount, currency.ticker)
+                    } catch (e: NumberFormatException) {
+                        Log.e("input bad", "input: $newValue  e: $e")
+                        //onValueChange(0f, currency.ticker)
+                    }
                 },
                 label = { Text(currency.ticker) },
-                modifier = Modifier.width(100.dp)
+                modifier = Modifier.width(100.dp),
             )
         }
 
@@ -188,40 +263,54 @@ fun CurrencyField(
 @Composable
 fun CurrencyConversionList() {
     val mainActivity = LocalContext.current as? MainActivity ?:
-    return Text("Unable to access MainActivity");
+        return Text("Unable to access MainActivity")
 
     val apiData by mainActivity.apiData.collectAsState()
     val apiFailed by mainActivity.apiFailed.collectAsState()
 
     Log.d("after api!", apiData.toString())
-    
+
     if(apiData == null && !apiFailed) {
         Text("waiting for data...")
     } else if (apiFailed) {
         Text("FAILED TO FETCH DATA!")
     }
 
-    var baseCurrency by remember { mutableStateOf("USD") }  // Default currency
-    var baseValue by remember { mutableStateOf("1.0") }     // Default input
+    val baseCurrencyTicker = "ISK"
+    var baseAmount by remember { mutableDoubleStateOf(1000.0) }
+
+    var cc: CurrencyConverter? = null
+
+    if(apiData != null){
+        cc = CurrencyConverter(
+            currencyData = apiData!!,
+            baseCurrencyTicker = baseCurrencyTicker,
+        )
+    }else return
+
+
+    // Function to update the base amount when any field changes
+    val updateBaseAmount = { newAmount: Double, fromCurrency: String ->
+        val newBaseAmount = cc.convertCurrency(
+            newAmount,
+            fromCurrency,
+            baseCurrencyTicker
+        )
+        baseAmount = newBaseAmount
+    }
 
     LazyColumn {
         items(apiData ?: emptyList()) {currency ->
-            CurrencyField(currency,
-                baseCurrency = baseCurrency,
-                baseValue = baseValue,
-                onBaseValueChange = { newValue, newCurrency ->
-                    baseValue = newValue
-                    baseCurrency = newCurrency
-                }
+            CurrencyField(
+                currency,
+                cc,
+                baseAmount,
+                baseCurrencyTicker,
+                updateBaseAmount
             )
         }
     }
 }
-
-fun convertCurrency(apiData: List<Currency>, amount: Double, from: String, to: String) {
-
-}
-
 
 
 data class Message(val author: String, val body: String)
